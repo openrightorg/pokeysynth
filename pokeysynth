@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+# Pokey synth. Plays midi data with software pokey generated sounds
+
+from pygame import midi
+import math
+import itertools
+import pyaudio
+
+import sys
+
+SAMPLE_RATE = 16000
+FRAMES_PER_BUFFER = 256
+ARATE = 64000
+# note: atari ~64k clock = 1789772.5/28
+# but arate needs to be a multiple of SAMPLE_RATE to avoid need for proper downsampling at higher frequencies
+ARATE15 = 15699
+
+scounter = 0
+
+class PokeyChannel:
+	def __init__(self):
+		self.dist = 0xa
+		self.audf = 0
+		self.volume = 0
+		self.value = 0
+		self.anext = 0
+		self.use_15k = False
+
+achannel = [ PokeyChannel() for _ in range(4) ]
+
+def note_to_audf(n, bend):
+	f = midi.midi_to_frequency(note)
+	#if(n < 47): return 255
+	if(f < 123.5): print(f)
+	use_15k = (f < 123.5)
+	return (3579545 // (114 if use_15k else 28 ) // (int(f) << 2) - 1, use_15k)
+
+def set_pokey_audf_audc(c, audc, audf, use_15k):
+	achannel[c].volume = audc & 0xf
+	achannel[c].dist = audc >> 4
+	achannel[c].audf = audf
+	achannel[c].use_15k = use_15k
+
+lfsr4 = 1
+lfsr5 = 1
+lfsr17 = 1
+
+def calc_lfsr4(v): return (v<<1) | ( ((v>>2) ^ (v>>3)) & 1)
+def calc_lfsr5(v): return (v<<1) | ( ((v>>2) ^ (v>>4)) & 0x1)
+def calc_lfsr9(v): return (v<<1) | ( ((v>>3) ^ (v>>8)) & 0x1)
+def calc_lfsr17(v): return (v<<1) & 0xffffffff | ( ((v>>2) ^ (v>>16)) & 0x1)
+
+n = 1
+lfsr4_lookup = [ n := calc_lfsr4(n) for _ in range(15) ]
+n = 1
+lfsr5_lookup = [ n := calc_lfsr5(n) for _ in range(31) ]
+
+def check_lfsr(dist, value):
+	global lfsr4
+	global lfsr5
+	global lfsr17
+	if(dist & 0x8):
+		return (value+1 if dist & 0x2 else lfsr4 if dist & 0x4 else lfsr17) & 1
+	return (lfsr5 if dist & 0x2 else lfsr5 & lfsr4 if dist & 0x4 else lfsr5 & lfsr17) & 1
+
+def generate_pokey():
+	global scounter
+	global lfsr17
+	global lfsr4
+	global lfsr5
+
+	out = 0
+
+	lfsr17 = calc_lfsr17(lfsr17)
+
+	arate = ARATE
+	for i in range(4):
+		if(achannel[i].use_15k): arate = ARATE15
+
+		if ( not achannel[i].audf): continue
+		audf_div = SAMPLE_RATE * (achannel[i].audf + 1)
+		if (arate > scounter % audf_div):
+			acounter = achannel[i].anext
+			achannel[i].anext += audf_div
+			lfsr4 = lfsr4_lookup[acounter % 15]
+			lfsr5 = lfsr5_lookup[acounter % 31]
+			achannel[i].value = check_lfsr(achannel[i].dist, achannel[i].value)
+		out += achannel[i].volume if achannel[i].value & 1 else 0
+	scounter += arate
+
+	return out
+
+def get_samples(in_data, frame_count, time_info, status):
+	samples = [generate_pokey() for i in range(frame_count)]
+	samples = bytes(samples)
+	return (samples, pyaudio.paContinue)
+
+p = pyaudio.PyAudio()
+stream = p.open(rate=SAMPLE_RATE, channels=1, format=pyaudio.paUInt8, output=True, frames_per_buffer=FRAMES_PER_BUFFER, stream_callback=get_samples)
+
+midi.init()
+midi_input = midi.Input(device_id=midi.get_default_input_id())
+
+MIDI_NOTE_OFF = 0b10000000
+MIDI_NOTE_ON = 0b10010000
+MIDI_NOTE_AFTERTOUCH = 0b10100000
+MIDI_PITCH_BEND = 0b11100000
+MIDI_PROGRAM_CHANGE = 0b11000000
+
+pitchbend = 0
+dist = [ 0xa, 0xa, 0xa, 0xa ]
+
+try:
+	while True:
+		for event in midi_input.read(num_events=8):
+			(status, data1, data2, data3), _  = event
+
+			mchannel = (status & 0b00001111) & 0x3;
+			command = status & 0b11110000;
+
+			if((command == MIDI_NOTE_ON or command == MIDI_NOTE_AFTERTOUCH) and data2 > 0):
+				note = data1
+				velocity = data2
+				set_pokey_audf_audc(mchannel, (dist[mchannel] << 4) | (velocity >> 3), *note_to_audf(note, pitchbend))
+			elif command == MIDI_NOTE_OFF:
+				set_pokey_audf_audc(mchannel, 0, 0, 0)
+			elif command == MIDI_PROGRAM_CHANGE:
+				program = data1
+				dist[mchannel] = 0x8 if program == 117 else \
+					0xa if program == 116 else \
+					0x4 if program == 115 else \
+					0x2 if program == 114 else \
+					0xa
+			elif command == MIDI_PITCH_BEND:
+				pitchbend = data1
+				pitchbend |= (data2 << 7)
+
+except KeyboardInterrupt:
+	stream.stop_stream()
+	stream.close()
+	midi_input.close()
+	p.terminate()
