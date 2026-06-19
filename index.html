@@ -364,6 +364,10 @@
         this.lfsr17 = 1;
         this.pitchbend = [8192, 8192, 8192, 8192];
         this.dist = [0xa, 0xa, 0xa, 0xa];
+        this.renderedSamples = 0;
+        this.filePlayback = null;
+        this.dirtyChannels = new Set();
+        this.displayUpdateScheduled = false;
         this.channels = Array.from({ length: 4 }, () => ({
           dist: 0xa,
           audf: 0,
@@ -416,7 +420,9 @@
           this.node.onaudioprocess = (event) => {
             const output = event.outputBuffer.getChannelData(0);
             for (let i = 0; i < output.length; i++) {
+              this.processFilePlayback();
               output[i] = (this.generate() - 30) / 32;
+              this.renderedSamples++;
             }
           };
           this.source.connect(this.node);
@@ -431,6 +437,38 @@
 
       setGain(value) {
         if (this.gain) this.gain.gain.value = value;
+      }
+
+      playMidiFile(midiFile, onFinished) {
+        this.filePlayback = {
+          events: midiFile.midiEvents,
+          duration: midiFile.duration,
+          cursor: 0,
+          startSample: this.renderedSamples,
+          onFinished
+        };
+      }
+
+      stopMidiFile() {
+        this.filePlayback = null;
+      }
+
+      processFilePlayback() {
+        if (!this.filePlayback) return;
+        const playback = this.filePlayback;
+        const elapsed = (this.renderedSamples - playback.startSample) / this.sampleRate;
+        while (
+          playback.cursor < playback.events.length &&
+          playback.events[playback.cursor].time <= elapsed
+        ) {
+          this.handleMidi(playback.events[playback.cursor].data);
+          playback.cursor++;
+        }
+
+        if (playback.cursor >= playback.events.length && elapsed >= playback.duration) {
+          this.filePlayback = null;
+          if (playback.onFinished) playback.onFinished(elapsed);
+        }
       }
 
       noteToAudf(note, bend) {
@@ -450,7 +488,19 @@
         c.use15k = use15k;
         c.note = note;
         c.velocity = velocity;
-        this.updateChannelDisplay(channel);
+        this.queueChannelDisplay(channel);
+      }
+
+      queueChannelDisplay(channel) {
+        this.dirtyChannels.add(channel);
+        if (this.displayUpdateScheduled) return;
+        this.displayUpdateScheduled = true;
+        requestAnimationFrame(() => {
+          this.displayUpdateScheduled = false;
+          const channels = [...this.dirtyChannels];
+          this.dirtyChannels.clear();
+          for (const dirtyChannel of channels) this.updateChannelDisplay(dirtyChannel);
+        });
       }
 
       updateChannelDisplay(channel) {
@@ -511,7 +561,7 @@
             data1 === 116 ? 0xa :
             data1 === 115 ? 0x4 :
             data1 === 114 ? 0x2 : 0xa;
-          this.updateChannelDisplay(mchannel);
+          this.queueChannelDisplay(mchannel);
         } else if (command === MIDI_PITCH_BEND) {
           this.pitchbend[mchannel] = data1 | (data2 << 7);
           const c = this.channels[mchannel];
@@ -646,7 +696,6 @@
     let midiAccess = null;
     let selectedInput = null;
     let loadedMidi = null;
-    let fileTimers = [];
 
     async function ensureAudio() {
       try {
@@ -657,8 +706,7 @@
     }
 
     function stopFile({ silence = true } = {}) {
-      for (const timer of fileTimers) clearTimeout(timer);
-      fileTimers = [];
+      synth.stopMidiFile();
       els.playFile.disabled = !loadedMidi;
       els.stopFile.disabled = true;
       els.sourceState.textContent = loadedMidi ? "MIDI file loaded" : "No source loaded";
@@ -672,20 +720,13 @@
       els.playFile.disabled = true;
       els.stopFile.disabled = false;
       els.sourceState.textContent = "Playing MIDI file";
-      const startTime = performance.now();
-      for (const event of loadedMidi.midiEvents) {
-        const timer = setTimeout(() => synth.handleMidi(event.data), event.time * 1000);
-        fileTimers.push(timer);
-      }
-      const endTimer = setTimeout(() => {
-        fileTimers = [];
+      synth.playMidiFile(loadedMidi, (elapsed) => {
         els.playFile.disabled = false;
         els.stopFile.disabled = true;
         els.sourceState.textContent = "MIDI file loaded";
         synth.panic();
-        log(`Finished file playback in ${((performance.now() - startTime) / 1000).toFixed(1)}s.`);
-      }, loadedMidi.duration * 1000 + 250);
-      fileTimers.push(endTimer);
+        log(`Finished file playback in ${elapsed.toFixed(1)}s.`);
+      });
     }
 
     function refreshMidiInputs() {
