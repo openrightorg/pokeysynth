@@ -641,7 +641,8 @@
 
       parseTrack() {
         if (this.readText(4) !== "MTrk") throw new Error("Missing MIDI track.");
-        const end = this.pos + this.readU32();
+        const length = this.readU32();
+        const end = this.pos + length;
         let tick = 0;
         let runningStatus = 0;
         while (this.pos < end) {
@@ -664,7 +665,8 @@
               this.pos += length;
             }
           } else if (status === 0xf0 || status === 0xf7) {
-            this.pos += this.readVar();
+            const length = this.readVar();
+            this.pos += length;
           } else {
             const command = status & 0xf0;
             const data1 = this.readU8();
