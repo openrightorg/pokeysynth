@@ -423,6 +423,8 @@
           volume: 0,
           value: 0,
           anext: 0,
+          phase: 0,
+          tickRate: 0,
           use15k: false,
           note: null,
           velocity: 0
@@ -566,13 +568,20 @@
       noteToAudf(note, bend) {
         const semitoneBend = ((bend - 8192) / 8192) * 2;
         const frequency = 440 * Math.pow(2, (note + semitoneBend - 69) / 12);
-        const use15k = frequency < 123.5;
-        const clockDivisor = use15k ? 114 : 28;
-        const audf = Math.max(1, Math.min(255, Math.floor(3579545 / clockDivisor / (Math.floor(frequency) << 2) - 1)));
-        return { audf, use15k };
+        const normalAudf = Math.round(ARATE / (frequency * 2) - 1);
+        const lowAudf = Math.round(ARATE15 / (frequency * 2) - 1);
+        const normalError = normalAudf >= 1 && normalAudf <= 255 ?
+          Math.abs(frequency - ARATE / ((normalAudf + 1) * 2)) :
+          Number.POSITIVE_INFINITY;
+        const lowError = lowAudf >= 1 && lowAudf <= 255 ?
+          Math.abs(frequency - ARATE15 / ((lowAudf + 1) * 2)) :
+          Number.POSITIVE_INFINITY;
+        const use15k = lowError < normalError;
+        const audf = Math.max(1, Math.min(255, use15k ? lowAudf : normalAudf));
+        return { audf, use15k, tickRate: frequency * 2 };
       }
 
-      setPokeyAudfAudc(channel, audc, audf, use15k, note = null, velocity = 0) {
+      setPokeyAudfAudc(channel, audc, audf, use15k, note = null, velocity = 0, tickRate = 0) {
         this.ensureChip(Math.floor(channel / POKEY_CHANNELS));
         const c = this.channels[channel];
         c.volume = audc & 0xf;
@@ -581,6 +590,8 @@
         c.use15k = use15k;
         c.note = note;
         c.velocity = velocity;
+        c.tickRate = tickRate;
+        if (!tickRate) c.phase = 0;
         this.queueChannelDisplay(channel);
       }
 
@@ -625,14 +636,14 @@
           let arate = ARATE;
           for (let i = 0; i < POKEY_CHANNELS; i++) {
             const c = this.channels[chipIndex * POKEY_CHANNELS + i];
-            if (c.use15k) arate = ARATE15;
-            if (!c.audf) continue;
-            const audfDiv = this.sampleRate * (c.audf + 1);
-            if (arate > chip.scounter % audfDiv) {
-              const acounter = c.anext;
-              c.anext += audfDiv;
-              chip.lfsr4 = this.lfsr4Lookup[acounter % 15];
-              chip.lfsr5 = this.lfsr5Lookup[acounter % 31];
+            if (!c.audf || !c.volume) continue;
+            const tickRate = c.tickRate || (c.use15k ? ARATE15 : arate) / (c.audf + 1);
+            c.phase += tickRate / this.sampleRate;
+            while (c.phase >= 1) {
+              c.phase -= 1;
+              c.anext++;
+              chip.lfsr4 = this.lfsr4Lookup[c.anext % 15];
+              chip.lfsr5 = this.lfsr5Lookup[c.anext % 31];
               c.value = this.checkLfsr(chip, c.dist, c.value);
             }
             out += c.value & 1 ? c.volume : 0;
@@ -650,8 +661,8 @@
         if (command < MIDI_NOTE_OFF || command > MIDI_PITCH_BEND) return;
         const mchannel = this.ensureMidiChannel(status & 0x0f);
         if ((command === MIDI_NOTE_ON || command === MIDI_AFTERTOUCH) && data2 > 0) {
-          const { audf, use15k } = this.noteToAudf(data1, this.pitchbend[mchannel]);
-          this.setPokeyAudfAudc(mchannel, (this.dist[mchannel] << 4) | (data2 >> 3), audf, use15k, data1, data2);
+          const { audf, use15k, tickRate } = this.noteToAudf(data1, this.pitchbend[mchannel]);
+          this.setPokeyAudfAudc(mchannel, (this.dist[mchannel] << 4) | (data2 >> 3), audf, use15k, data1, data2, tickRate);
         } else if (command === MIDI_NOTE_OFF || (command === MIDI_NOTE_ON && data2 === 0)) {
           this.setPokeyAudfAudc(mchannel, 0, 0, false);
         } else if (command === MIDI_PROGRAM_CHANGE) {
@@ -664,8 +675,8 @@
           this.pitchbend[mchannel] = data1 | (data2 << 7);
           const c = this.channels[mchannel];
           if (c.note != null && c.volume > 0) {
-            const { audf, use15k } = this.noteToAudf(c.note, this.pitchbend[mchannel]);
-            this.setPokeyAudfAudc(mchannel, (this.dist[mchannel] << 4) | c.volume, audf, use15k, c.note, c.velocity);
+            const { audf, use15k, tickRate } = this.noteToAudf(c.note, this.pitchbend[mchannel]);
+            this.setPokeyAudfAudc(mchannel, (this.dist[mchannel] << 4) | c.volume, audf, use15k, c.note, c.velocity, tickRate);
           }
         }
       }
