@@ -288,10 +288,12 @@
         <div class="row">
           <label class="file-button" for="midiFile">Load MIDI</label>
           <input id="midiFile" type="file" accept=".mid,.midi,.midicsv,.csv,text/csv,audio/midi,audio/x-midi">
+          <select id="songLibrary"></select>
+          <button id="loadSong">Load Song</button>
           <button id="playFile" class="primary" disabled>Play</button>
           <button id="stopFile" disabled>Stop</button>
         </div>
-        <div class="meta" id="fileMeta">Choose a Standard MIDI File or midicsv file.</div>
+        <div class="meta" id="fileMeta">Choose a Standard MIDI File, midicsv file, or library song.</div>
       </section>
 
       <section class="midi-panel">
@@ -331,11 +333,21 @@
     const POKEY_CHANNELS = 4;
     const MAX_POKEY_CHIPS = 4;
     const MAX_POKEY_CHANNELS = POKEY_CHANNELS * MAX_POKEY_CHIPS;
+    const SONG_LIBRARY = [
+      { name: "Archon", url: "https://openright.org/static/midi/Archon.sapr.mid" },
+      { name: "Archon II", url: "https://openright.org/static/midi/Archon_II.sapr.mid" },
+      { name: "Boulder Dash", url: "https://openright.org/static/midi/Boulder_Dash.sapr.mid" },
+      { name: "Gyruss", url: "https://openright.org/static/midi/Gyruss_0.sapr.mid" },
+      { name: "Pac Man", url: "https://openright.org/static/midi/Pac_Man.sapr.mid" },
+      { name: "Eruption", url: "https://openright.org/static/midi/Eruption.mid" },
+    ];
 
     const els = {
       audioState: document.querySelector("#audioState"),
       sourceState: document.querySelector("#sourceState"),
       midiFile: document.querySelector("#midiFile"),
+      songLibrary: document.querySelector("#songLibrary"),
+      loadSong: document.querySelector("#loadSong"),
       playFile: document.querySelector("#playFile"),
       stopFile: document.querySelector("#stopFile"),
       fileMeta: document.querySelector("#fileMeta"),
@@ -920,6 +932,16 @@
       return new MidiFile(await file.arrayBuffer());
     }
 
+    async function loadMidiLikeUrl(url) {
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`Could not load ${url}: ${response.status} ${response.statusText}`);
+      const cleanUrl = new URL(url, window.location.href).pathname.toLowerCase();
+      if (cleanUrl.endsWith(".midicsv") || cleanUrl.endsWith(".csv")) {
+        return new MidiCsvFile(await response.text());
+      }
+      return new MidiFile(await response.arrayBuffer());
+    }
+
     const synth = new PokeySynth();
     let midiAccess = null;
     let selectedInput = null;
@@ -989,6 +1011,32 @@
       log(`Selected MIDI input: ${selectedInput.name || selectedInput.id}`);
     }
 
+    function setLoadedMidi(midi, label) {
+      loadedMidi = midi;
+      synth.configureForMidiFile(loadedMidi);
+      els.playFile.disabled = loadedMidi.midiEvents.length === 0;
+      els.fileMeta.textContent = `${label}: ${loadedMidi.midiEvents.length} MIDI events, ${loadedMidi.duration.toFixed(1)}s.`;
+      els.sourceState.textContent = "MIDI file loaded";
+      log(`Loaded ${label}.`);
+    }
+
+    function clearLoadedMidi(message) {
+      loadedMidi = null;
+      els.playFile.disabled = true;
+      els.fileMeta.textContent = message;
+    }
+
+    function initSongLibrary() {
+      els.songLibrary.innerHTML = "";
+      for (const song of SONG_LIBRARY) {
+        els.songLibrary.append(new Option(song.name, song.url));
+      }
+      const disabled = SONG_LIBRARY.length === 0;
+      els.songLibrary.disabled = disabled;
+      els.loadSong.disabled = disabled;
+      if (disabled) els.songLibrary.append(new Option("No library songs", ""));
+    }
+
     els.startAudio.addEventListener("click", ensureAudio);
     els.gain.addEventListener("input", () => synth.setGain(Number(els.gain.value)));
     els.panic.addEventListener("click", () => {
@@ -1002,17 +1050,26 @@
       if (!file) return;
       stopFile();
       try {
-        loadedMidi = await loadMidiLikeFile(file);
-        synth.configureForMidiFile(loadedMidi);
-        els.playFile.disabled = loadedMidi.midiEvents.length === 0;
-        els.fileMeta.textContent = `${file.name}: ${loadedMidi.midiEvents.length} MIDI events, ${loadedMidi.duration.toFixed(1)}s.`;
-        els.sourceState.textContent = "MIDI file loaded";
-        log(`Loaded ${file.name}.`);
+        setLoadedMidi(await loadMidiLikeFile(file), file.name);
       } catch (error) {
-        loadedMidi = null;
-        els.playFile.disabled = true;
-        els.fileMeta.textContent = error.message;
+        clearLoadedMidi(error.message);
         log(`Could not load MIDI file: ${error.message}`);
+      }
+    });
+
+    els.loadSong.addEventListener("click", async () => {
+      const song = SONG_LIBRARY.find((entry) => entry.url === els.songLibrary.value);
+      if (!song) return;
+      stopFile();
+      els.loadSong.disabled = true;
+      els.fileMeta.textContent = `Loading ${song.name}...`;
+      try {
+        setLoadedMidi(await loadMidiLikeUrl(song.url), song.name);
+      } catch (error) {
+        clearLoadedMidi(error.message);
+        log(`Could not load ${song.name}: ${error.message}`);
+      } finally {
+        els.loadSong.disabled = SONG_LIBRARY.length === 0;
       }
     });
 
@@ -1038,6 +1095,7 @@
     });
 
     els.midiInputs.addEventListener("change", () => selectMidiInput(els.midiInputs.value));
+    initSongLibrary();
   </script>
 </body>
 </html>
