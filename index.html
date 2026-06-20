@@ -256,7 +256,7 @@
     <header>
       <div>
         <h1>POKEY MIDI Synth</h1>
-        <p class="subtitle">Four-channel Atari POKEY-style synthesis driven by a MIDI file or a live Web MIDI device.</p>
+        <p class="subtitle">Four-channel Atari POKEY-style synthesis driven by a MIDI or midicsv file, or a live Web MIDI device.</p>
       </div>
       <div class="status">
         <strong id="audioState">Audio stopped</strong>
@@ -269,11 +269,11 @@
         <h2>MIDI File</h2>
         <div class="row">
           <label class="file-button" for="midiFile">Load MIDI</label>
-          <input id="midiFile" type="file" accept=".mid,.midi,audio/midi,audio/x-midi">
+          <input id="midiFile" type="file" accept=".mid,.midi,.midicsv,.csv,text/csv,audio/midi,audio/x-midi">
           <button id="playFile" class="primary" disabled>Play</button>
           <button id="stopFile" disabled>Stop</button>
         </div>
-        <div class="meta" id="fileMeta">Choose a Standard MIDI File.</div>
+        <div class="meta" id="fileMeta">Choose a Standard MIDI File or midicsv file.</div>
       </section>
 
       <section class="midi-panel">
@@ -692,6 +692,123 @@
       }
     }
 
+    class MidiCsvFile {
+      constructor(text) {
+        this.division = 480;
+        this.events = [];
+        this.parse(text);
+      }
+
+      parse(text) {
+        const lines = text.split(/\r?\n/);
+        for (let lineNumber = 0; lineNumber < lines.length; lineNumber++) {
+          const line = lines[lineNumber].trim();
+          if (!line || line.startsWith("#") || line.startsWith(";")) continue;
+
+          const fields = parseCsvRecord(line);
+          if (fields.length < 3) throw new Error(`Invalid midicsv record on line ${lineNumber + 1}.`);
+
+          const tick = parseInteger(fields[1], `time on line ${lineNumber + 1}`);
+          const type = fields[2].trim().toLowerCase();
+
+          if (type === "header") {
+            if (fields.length < 6) throw new Error(`Invalid Header record on line ${lineNumber + 1}.`);
+            this.division = parseInteger(fields[5], `division on line ${lineNumber + 1}`);
+            if (this.division & 0x8000) throw new Error("SMPTE time division is not supported.");
+          } else if (type === "tempo") {
+            this.events.push({
+              tick,
+              tempo: parseInteger(fields[3], `tempo on line ${lineNumber + 1}`)
+            });
+          } else {
+            const data = this.channelEventToMidi(type, fields, lineNumber + 1);
+            if (data) this.events.push({ tick, data });
+          }
+        }
+
+        this.events.sort((a, b) => {
+          if (a.tick !== b.tick) return a.tick - b.tick;
+          if (a.tempo && !b.tempo) return -1;
+          if (!a.tempo && b.tempo) return 1;
+          return 0;
+        });
+        this.applyTempo();
+      }
+
+      channelEventToMidi(type, fields, lineNumber) {
+        const channel = () => parseInteger(fields[3], `channel on line ${lineNumber}`) & 0x0f;
+        const value = (index, name) => parseInteger(fields[index], `${name} on line ${lineNumber}`) & 0x7f;
+
+        if (type === "note_on_c") return [MIDI_NOTE_ON | channel(), value(4, "note"), value(5, "velocity")];
+        if (type === "note_off_c") return [MIDI_NOTE_OFF | channel(), value(4, "note"), value(5, "velocity")];
+        if (type === "poly_aftertouch_c") return [MIDI_AFTERTOUCH | channel(), value(4, "note"), value(5, "value")];
+        if (type === "program_c") return [MIDI_PROGRAM_CHANGE | channel(), value(4, "program"), 0];
+        if (type === "pitch_bend_c") {
+          const bend = Math.max(0, Math.min(16383, parseInteger(fields[4], `pitch bend on line ${lineNumber}`)));
+          return [MIDI_PITCH_BEND | channel(), bend & 0x7f, (bend >> 7) & 0x7f];
+        }
+        if (type === "control_c") return [0xb0 | channel(), value(4, "control"), value(5, "value")];
+        if (type === "channel_aftertouch_c") return [0xd0 | channel(), value(4, "value"), 0];
+        return null;
+      }
+
+      applyTempo() {
+        let tempo = 500000;
+        let lastTick = 0;
+        let seconds = 0;
+        for (const event of this.events) {
+          seconds += (event.tick - lastTick) * tempo / this.division / 1000000;
+          event.time = seconds;
+          lastTick = event.tick;
+          if (event.tempo) tempo = event.tempo;
+        }
+        this.duration = this.events.length ? this.events[this.events.length - 1].time : 0;
+        this.midiEvents = this.events.filter((event) => event.data);
+      }
+    }
+
+    function parseInteger(value, name) {
+      const number = Number.parseInt(String(value).trim(), 10);
+      if (!Number.isFinite(number)) throw new Error(`Invalid ${name}.`);
+      return number;
+    }
+
+    function parseCsvRecord(line) {
+      const fields = [];
+      let field = "";
+      let quoted = false;
+      for (let i = 0; i < line.length; i++) {
+        const char = line[i];
+        if (quoted) {
+          if (char === '"' && line[i + 1] === '"') {
+            field += '"';
+            i++;
+          } else if (char === '"') {
+            quoted = false;
+          } else {
+            field += char;
+          }
+        } else if (char === '"') {
+          quoted = true;
+        } else if (char === ",") {
+          fields.push(field.trim());
+          field = "";
+        } else {
+          field += char;
+        }
+      }
+      fields.push(field.trim());
+      return fields;
+    }
+
+    async function loadMidiLikeFile(file) {
+      const name = file.name.toLowerCase();
+      if (name.endsWith(".midicsv") || name.endsWith(".csv")) {
+        return new MidiCsvFile(await file.text());
+      }
+      return new MidiFile(await file.arrayBuffer());
+    }
+
     const synth = new PokeySynth();
     let midiAccess = null;
     let selectedInput = null;
@@ -774,7 +891,7 @@
       if (!file) return;
       stopFile();
       try {
-        loadedMidi = new MidiFile(await file.arrayBuffer());
+        loadedMidi = await loadMidiLikeFile(file);
         els.playFile.disabled = loadedMidi.midiEvents.length === 0;
         els.fileMeta.textContent = `${file.name}: ${loadedMidi.midiEvents.length} MIDI events, ${loadedMidi.duration.toFixed(1)}s.`;
         els.sourceState.textContent = "MIDI file loaded";
