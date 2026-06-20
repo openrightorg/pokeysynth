@@ -171,6 +171,24 @@
 
     .channels {
       display: grid;
+      gap: 14px;
+    }
+
+    .chip {
+      display: grid;
+      gap: 10px;
+    }
+
+    .chip-title {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.88rem;
+      font-weight: 700;
+      letter-spacing: 0;
+    }
+
+    .chip-grid {
+      display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
       gap: 10px;
     }
@@ -245,7 +263,7 @@
         grid-column: 1 / -1;
       }
 
-      .channels {
+      .chip-grid {
         grid-template-columns: repeat(2, minmax(0, 1fr));
       }
     }
@@ -256,7 +274,7 @@
     <header>
       <div>
         <h1>POKEY MIDI Synth</h1>
-        <p class="subtitle">Four-channel Atari POKEY-style synthesis driven by a MIDI or midicsv file, or a live Web MIDI device.</p>
+        <p class="subtitle">Atari POKEY-style synthesis driven by a MIDI or midicsv file, or a live Web MIDI device.</p>
       </div>
       <div class="status">
         <strong id="audioState">Audio stopped</strong>
@@ -310,6 +328,9 @@
     const MIDI_AFTERTOUCH = 0xa0;
     const MIDI_PROGRAM_CHANGE = 0xc0;
     const MIDI_PITCH_BEND = 0xe0;
+    const POKEY_CHANNELS = 4;
+    const MAX_POKEY_CHIPS = 4;
+    const MAX_POKEY_CHANNELS = POKEY_CHANNELS * MAX_POKEY_CHIPS;
 
     const els = {
       audioState: document.querySelector("#audioState"),
@@ -328,18 +349,43 @@
       log: document.querySelector("#log")
     };
 
-    for (let i = 0; i < 4; i++) {
-      const channel = document.createElement("div");
-      channel.className = "channel";
-      channel.innerHTML = `
-        <div class="channel-top"><span>POKEY ${i + 1}</span><span class="dist">dist A</span></div>
-        <div class="note">--</div>
-        <div class="meter"><span></span></div>
-      `;
-      els.channels.append(channel);
+    const channelEls = [];
+
+    function ensureChipDisplay(chipIndex) {
+      while (els.channels.children.length <= chipIndex) {
+        const chipNumber = els.channels.children.length + 1;
+        const chip = document.createElement("div");
+        chip.className = "chip";
+        chip.innerHTML = `<h3 class="chip-title">POKEY chip ${chipNumber}</h3><div class="chip-grid"></div>`;
+        const grid = chip.querySelector(".chip-grid");
+        for (let i = 0; i < POKEY_CHANNELS; i++) {
+          const channelIndex = (chipNumber - 1) * POKEY_CHANNELS + i;
+          const channel = document.createElement("div");
+          channel.className = "channel";
+          channel.innerHTML = `
+            <div class="channel-top"><span>Ch ${channelIndex + 1}</span><span class="dist">dist A</span></div>
+            <div class="note">--</div>
+            <div class="meter"><span></span></div>
+          `;
+          grid.append(channel);
+          channelEls[channelIndex] = channel;
+        }
+        els.channels.append(chip);
+      }
     }
 
-    const channelEls = [...document.querySelectorAll(".channel")];
+    function setVisibleChipCount(count) {
+      const chipCount = Math.max(1, Math.min(MAX_POKEY_CHIPS, count));
+      ensureChipDisplay(chipCount - 1);
+      while (els.channels.children.length > chipCount) {
+        const chip = els.channels.lastElementChild;
+        const start = (els.channels.children.length - 1) * POKEY_CHANNELS;
+        for (let i = 0; i < POKEY_CHANNELS; i++) channelEls[start + i] = null;
+        chip.remove();
+      }
+    }
+
+    ensureChipDisplay(0);
 
     function log(message) {
       const time = new Date().toLocaleTimeString();
@@ -358,17 +404,20 @@
         this.gain = null;
         this.source = null;
         this.sampleRate = SAMPLE_RATE;
-        this.scounter = 0;
-        this.lfsr4 = 1;
-        this.lfsr5 = 1;
-        this.lfsr17 = 1;
-        this.pitchbend = [8192, 8192, 8192, 8192];
-        this.dist = [0xa, 0xa, 0xa, 0xa];
+        this.pitchbend = Array(MAX_POKEY_CHANNELS).fill(8192);
+        this.dist = Array(MAX_POKEY_CHANNELS).fill(0xa);
         this.renderedSamples = 0;
         this.filePlayback = null;
         this.dirtyChannels = new Set();
         this.displayUpdateScheduled = false;
-        this.channels = Array.from({ length: 4 }, () => ({
+        this.chips = [this.createChip()];
+        this.channels = Array.from({ length: MAX_POKEY_CHANNELS }, () => this.createChannel());
+        this.lfsr4Lookup = this.makeLookup(15, 1, this.calcLfsr4);
+        this.lfsr5Lookup = this.makeLookup(31, 1, this.calcLfsr5);
+      }
+
+      createChannel() {
+        return {
           dist: 0xa,
           audf: 0,
           volume: 0,
@@ -377,9 +426,52 @@
           use15k: false,
           note: null,
           velocity: 0
-        }));
-        this.lfsr4Lookup = this.makeLookup(15, 1, this.calcLfsr4);
-        this.lfsr5Lookup = this.makeLookup(31, 1, this.calcLfsr5);
+        };
+      }
+
+      createChip() {
+        return {
+          scounter: 0,
+          lfsr4: 1,
+          lfsr5: 1,
+          lfsr17: 1
+        };
+      }
+
+      ensureChip(chipIndex) {
+        const cappedIndex = Math.min(chipIndex, MAX_POKEY_CHIPS - 1);
+        while (this.chips.length <= cappedIndex) {
+          this.chips.push(this.createChip());
+          ensureChipDisplay(this.chips.length - 1);
+        }
+      }
+
+      setChipCount(count) {
+        const chipCount = Math.max(1, Math.min(MAX_POKEY_CHIPS, count));
+        this.chips = Array.from({ length: chipCount }, () => this.createChip());
+        this.pitchbend.fill(8192);
+        this.dist.fill(0xa);
+        this.channels = Array.from({ length: MAX_POKEY_CHANNELS }, () => this.createChannel());
+        this.dirtyChannels.clear();
+        setVisibleChipCount(chipCount);
+        for (let i = 0; i < chipCount * POKEY_CHANNELS; i++) this.queueChannelDisplay(i);
+      }
+
+      ensureMidiChannel(midiChannel) {
+        const slot = Math.min(midiChannel, MAX_POKEY_CHANNELS - 1);
+        this.ensureChip(Math.floor(slot / POKEY_CHANNELS));
+        return slot;
+      }
+
+      configureForMidiFile(midiFile) {
+        let maxChannel = 0;
+        for (const event of midiFile.midiEvents) {
+          const command = event.data[0] & 0xf0;
+          if (command >= MIDI_NOTE_OFF && command <= MIDI_PITCH_BEND) {
+            maxChannel = Math.max(maxChannel, event.data[0] & 0x0f);
+          }
+        }
+        this.setChipCount(Math.floor(maxChannel / POKEY_CHANNELS) + 1);
       }
 
       makeLookup(count, start, fn) {
@@ -421,7 +513,7 @@
             const output = event.outputBuffer.getChannelData(0);
             for (let i = 0; i < output.length; i++) {
               this.processFilePlayback();
-              output[i] = (this.generate() - 30) / 32;
+              output[i] = (this.generate() - this.chips.length * 30) / (this.chips.length * 32);
               this.renderedSamples++;
             }
           };
@@ -481,6 +573,7 @@
       }
 
       setPokeyAudfAudc(channel, audc, audf, use15k, note = null, velocity = 0) {
+        this.ensureChip(Math.floor(channel / POKEY_CHANNELS));
         const c = this.channels[channel];
         c.volume = audc & 0xf;
         c.dist = audc >> 4;
@@ -506,42 +599,46 @@
       updateChannelDisplay(channel) {
         const c = this.channels[channel];
         const el = channelEls[channel];
+        if (!el) return;
         el.classList.toggle("active", c.volume > 0);
         el.querySelector(".dist").textContent = `dist ${c.dist.toString(16).toUpperCase()}`;
         el.querySelector(".note").textContent = c.note == null ? "--" : midiNoteName(c.note);
         el.querySelector(".meter span").style.width = `${Math.min(100, c.volume / 15 * 100)}%`;
       }
 
-      checkLfsr(dist, value) {
+      checkLfsr(chip, dist, value) {
         if (dist & 0x8) {
           if (dist & 0x2) return (value + 1) & 1;
-          if (dist & 0x4) return this.lfsr4 & 1;
-          return this.lfsr17 & 1;
+          if (dist & 0x4) return chip.lfsr4 & 1;
+          return chip.lfsr17 & 1;
         }
-        if (dist & 0x2) return this.lfsr5 & 1;
-        if (dist & 0x4) return (this.lfsr5 & this.lfsr4) & 1;
-        return (this.lfsr5 & this.lfsr17) & 1;
+        if (dist & 0x2) return chip.lfsr5 & 1;
+        if (dist & 0x4) return (chip.lfsr5 & chip.lfsr4) & 1;
+        return (chip.lfsr5 & chip.lfsr17) & 1;
       }
 
       generate() {
         let out = 0;
-        this.lfsr17 = this.calcLfsr17(this.lfsr17);
-        let arate = ARATE;
-        for (let i = 0; i < 4; i++) {
-          const c = this.channels[i];
-          if (c.use15k) arate = ARATE15;
-          if (!c.audf) continue;
-          const audfDiv = this.sampleRate * (c.audf + 1);
-          if (arate > this.scounter % audfDiv) {
-            const acounter = c.anext;
-            c.anext += audfDiv;
-            this.lfsr4 = this.lfsr4Lookup[acounter % 15];
-            this.lfsr5 = this.lfsr5Lookup[acounter % 31];
-            c.value = this.checkLfsr(c.dist, c.value);
+        for (let chipIndex = 0; chipIndex < this.chips.length; chipIndex++) {
+          const chip = this.chips[chipIndex];
+          chip.lfsr17 = this.calcLfsr17(chip.lfsr17);
+          let arate = ARATE;
+          for (let i = 0; i < POKEY_CHANNELS; i++) {
+            const c = this.channels[chipIndex * POKEY_CHANNELS + i];
+            if (c.use15k) arate = ARATE15;
+            if (!c.audf) continue;
+            const audfDiv = this.sampleRate * (c.audf + 1);
+            if (arate > chip.scounter % audfDiv) {
+              const acounter = c.anext;
+              c.anext += audfDiv;
+              chip.lfsr4 = this.lfsr4Lookup[acounter % 15];
+              chip.lfsr5 = this.lfsr5Lookup[acounter % 31];
+              c.value = this.checkLfsr(chip, c.dist, c.value);
+            }
+            out += c.value & 1 ? c.volume : 0;
           }
-          out += c.value & 1 ? c.volume : 0;
+          chip.scounter += arate;
         }
-        this.scounter += arate;
         return out;
       }
 
@@ -549,8 +646,9 @@
         const status = data[0];
         const data1 = data[1] || 0;
         const data2 = data[2] || 0;
-        const mchannel = (status & 0x0f) & 0x03;
         const command = status & 0xf0;
+        if (command < MIDI_NOTE_OFF || command > MIDI_PITCH_BEND) return;
+        const mchannel = this.ensureMidiChannel(status & 0x0f);
         if ((command === MIDI_NOTE_ON || command === MIDI_AFTERTOUCH) && data2 > 0) {
           const { audf, use15k } = this.noteToAudf(data1, this.pitchbend[mchannel]);
           this.setPokeyAudfAudc(mchannel, (this.dist[mchannel] << 4) | (data2 >> 3), audf, use15k, data1, data2);
@@ -573,7 +671,7 @@
       }
 
       panic() {
-        for (let i = 0; i < 4; i++) {
+        for (let i = 0; i < this.chips.length * POKEY_CHANNELS; i++) {
           this.setPokeyAudfAudc(i, 0, 0, false);
         }
       }
@@ -894,6 +992,7 @@
       stopFile();
       try {
         loadedMidi = await loadMidiLikeFile(file);
+        synth.configureForMidiFile(loadedMidi);
         els.playFile.disabled = loadedMidi.midiEvents.length === 0;
         els.fileMeta.textContent = `${file.name}: ${loadedMidi.midiEvents.length} MIDI events, ${loadedMidi.duration.toFixed(1)}s.`;
         els.sourceState.textContent = "MIDI file loaded";
